@@ -111,6 +111,8 @@ typedef struct {
     VkShaderModule mod_moe; VkPipeline moe[2][10];            /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress),
                                                                  [1] with the block formats' paths (BD = 1), by staging size */
     int moe_xs, moe_xs_bd; uint8_t moe_tried[2][10];          /* their largest staging floats (0: the device cannot); made once asked for */
+    VkPipeline moe_f[3][10]; uint8_t moe_f_tried[3][10];      /* chain_moe.comp for one of our formats (FMTC 1, 2, 4), by staging size */
+    VkShaderModule mod_moe_gv; VkPipeline moe_gv[3][10]; uint8_t moe_gv_tried[3][10];   /* chain_moe_gv.comp: a decode's passes in our formats */
     VkShaderModule mod_moe_i8; VkPipeline moe_i8[10]; uint8_t moe_i8_tried[10];   /* chain_moe_i8.spv, by its codes' size */
     int idot, idot_set;                                       /* the integer form on (vkc_moe_set_idot: -1 = the device's default) */
     /* hybrid steps (vkc_hybrid_*): a timeline the device signals (its frames' sig_g) and one
@@ -120,7 +122,10 @@ typedef struct {
      * formats' grouped GEMMs (qmatmul_grp_bd.comp: [0] down, [1] gate+up) a pipeline per
      * (pass, ggml type), made on first use */
     VkShaderModule mod_rows, mod_grp[2]; VkPipeline rows; VkPipeline grp[2][64]; uint8_t grp_tried[2][64];
-    VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2];   /* qmatmul_grp_q.comp: our formats' (1, 2, 4) */
+    VkShaderModule mod_grpc[2]; VkPipeline grpc[2][64]; uint8_t grpc_tried[2][64];   /* qmatmul_grp*_bdc.comp: the same on the matrix units */
+    VkShaderModule mod_bdgc; VkPipeline bdgc[64]; uint8_t bdgc_tried[64];             /* qmatmul_gemm_bdc.comp: a GGUF's prompt GEMM on them */
+    VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2];      /* our formats' (1, 2, 4) in floats: qmatmul_grp_q.comp */
+    VkShaderModule mod_grpqc[2]; VkPipeline grpqc[2]; uint8_t grpqc_tried[2];   /* and on the matrix units: qmatmul_grp_qc.comp */
     int rows_tried;
     int discrete;                     /* a discrete card: vkc_prewarm's default */
     int gv2_all;                      /* chain_gemv2 for every int8 decode matrix it takes (COLI_VK_CHAIN_GEMV2=1, or not NVIDIA) */
@@ -128,6 +133,7 @@ typedef struct {
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
@@ -376,6 +382,29 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
     return p;
 }
 
+/* A pipeline of the matrix units' shaders: at the device's cooperative-matrix subgroup
+ * size (64 or 32), required, in full subgroups; NULL elsewhere or when it fails. */
+static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    int sg = KC.core.coop_sg;
+    if (!m || (sg != 64 && sg != 32)) return VK_NULL_HANDLE;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)sg};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                  .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
+        .layout = KC.pl};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return p;
+}
+/* COLI_VK_<name>=0 keeps a family of matrix-unit shaders off */
+static int coop_on(const char *env) {
+    const char *e = getenv(env);
+    return (KC.core.coop_sg == 64 || KC.core.coop_sg == 32) && !(e && *e == '0');
+}
+
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
 static void dsv4_shutdown(void);
 static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
@@ -392,6 +421,9 @@ static uint32_t kc_shared_limit(void) {
 /* qmatmul_gemm_bd.comp's fixed shared memory, held to the compiled shader's by
  * tests/test_vk_shared_memory.py: a device with less keeps the GEMV for a prompt's rows */
 #define GEMM_BD_SHARED 44544u
+/* and qmatmul_gemm_bdc.comp's (its tiles, its partial-tile patch and bdstep's tables): a device with
+ * less keeps the floats' GEMM there */
+#define GEMM_BDC_SHARED 33344u
 /* an ASan or UBSan build (gcc defines __SANITIZE_ADDRESS__; clang has __has_feature) */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
 #define VKC_SANITIZED 1
@@ -451,10 +483,12 @@ int vkc_init(void) {
         int xs = (int)((pp.limits.maxComputeSharedMemorySize - 128) / 16);   /* past the subgroups' 32 sums */
         if (xs > 4096) xs = 4096;
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
-            int32_t v = xs;
-            VkSpecializationMapEntry me = {0, 0, 4};
-            VkSpecializationInfo si = {1, &me, 4, &v};
+            /* and its variant for a row past the staging, x read from its buffer */
+            VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+            int32_t v[2] = {xs, 0}, vx[2] = {xs, 1};
+            VkSpecializationInfo si = {2, me, sizeof v, v}, six = {2, me, sizeof vx, vx};
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
+            KC.gemv4x = KC.gemv4 ? make_pipe(KC.mod_gemv4, &six) : VK_NULL_HANDLE;
         }
     }
     /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
@@ -533,21 +567,23 @@ int vkc_init(void) {
         if (f && (KC.mmod[i] = load_module(KC.core.spv_path, mla_file[i]))) KC.mpipe[i] = make_pipe(KC.mmod[i], NULL);
     }
     KC.mla_ok = KC.mpipe[PM_MLA] && KC.mpipe[PM_HGEMV] && KC.mpipe[PM_DSA];
-    /* the attention core on the matrix units (vkc_attn_flash_rows): subgroups of 64 with
-     * cooperative matrices, the shader's tiling assumes four of them */
-    if (KC.core.coop_sg == 64) KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv");
+    /* the attention core on the matrix units (vkc_attn_flash_rows): cooperative matrices at
+     * subgroups of 64 or 32, the shader's tiling four subgroups' (the first four of eight at 32) */
+    if (KC.core.coop_sg == 64 || KC.core.coop_sg == 32) KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv");
     dsv4_init();
-    /* the int8/int4 prompt GEMM on the matrix units (chain_gemm.comp, subgroups of 64);
+    /* the int8/int4 prompt GEMM on the matrix units (chain_gemm.comp, 256 invocations:
+     * four subgroups of 64, or eight of 32 as NVIDIA's cooperative matrices run);
      * COLI_VK_CHAIN_GEMM=0 leaves those formats to the GEMMs below */
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMM");
-        if (KC.core.coop_sg == 64 && !(e && *e == '0') && (KC.mod_tg = load_module(KC.core.spv_path, "chain_gemm.spv"))) {
+        if ((KC.core.coop_sg == 64 || KC.core.coop_sg == 32) && !(e && *e == '0') &&
+            (KC.mod_tg = load_module(KC.core.spv_path, "chain_gemm.spv"))) {
             int32_t tt = 4;
             VkSpecializationMapEntry me = {0, 0, 4};
             VkSpecializationInfo si = {1, &me, 4, &tt};
             VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-                .requiredSubgroupSize = 64};
+                .requiredSubgroupSize = (uint32_t)KC.core.coop_sg};
             VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
                           .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
@@ -898,18 +934,69 @@ static int copy_bytes(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t
 int vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n) {
     return copy_bytes(dst, doff * 4, src, soff * 4, n * 4);
 }
+/* ---- a grid of regions in one dispatch (chain_copy2d.comp), made on first use ----
+ * A prompt chunk's K and V rows go into the head-major cache as a region per (row, head):
+ * a copy command with 16384 regions of 512 bytes took 3.3 ms on an RTX PRO 4000 (OLMoE,
+ * a chunk of 1024 rows, four of them a layer). Regions on a grid (one length; the
+ * destination and the source moving by fixed steps along an inner and an outer index)
+ * take one dispatch from VKC_CP2_MIN regions; any other list keeps the copy command. */
+#define VKC_CP2_MIN 64
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_cp2[2];
+#define CP2 (g_cp2[g_kd])
+static VkPipeline cp2_pipe(void) {
+    if (CP2.pipe || CP2.tried || !vkc_ready()) return CP2.pipe;
+    CP2.tried = 1;
+    if ((CP2.mod = load_module(KC.core.spv_path, "chain_copy2d.spv"))) CP2.pipe = make_pipe(CP2.mod, NULL);
+    return CP2.pipe;
+}
+static void cp2_shutdown(void) {
+    if (CP2.pipe) vkDestroyPipeline(KC.dev, CP2.pipe, NULL);
+    if (CP2.mod) vkDestroyShaderModule(KC.dev, CP2.mod, NULL);
+    memset(&CP2, 0, sizeof CP2);
+}
+typedef struct { uint32_t d0, s0; int32_t dh, sh, dq, sq; uint32_t len, per, n; } VkcCp2;
+/* the regions' grid, when they are one: region i = (q, h) = (i / per, i % per) */
+static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g) {
+    if (n < VKC_CP2_MIN || !r[0].n) return 0;
+    long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
+    long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
+    int per = 1;
+    while (per < n && (long long)r[per].dst - (long long)r[per - 1].dst == dh && (long long)r[per].src - (long long)r[per - 1].src == sh) per++;
+    if (n % per) return 0;
+    int Q = n / per;
+    long long dq = Q > 1 ? (long long)r[per].dst - d0 : 0, sq = Q > 1 ? (long long)r[per].src - s0 : 0;
+    const long long I32 = 2147483647LL;
+    if (llabs(dh) * (per - 1) + llabs(dq) * (Q - 1) > I32 || llabs(sh) * (per - 1) + llabs(sq) * (Q - 1) > I32) return 0;
+    if ((long long)n * L > 4294967295LL) return 0;
+    for (int i = 0; i < n; i++) {
+        long long q = i / per, h = i % per;
+        if ((long long)r[i].n != L || (long long)r[i].dst != d0 + q * dq + h * dh || (long long)r[i].src != s0 + q * sq + h * sh) return 0;
+        if ((long long)r[i].dst + L > 4294967295LL || (long long)r[i].src + L > 4294967295LL) return 0;
+    }
+    *g = (VkcCp2){(uint32_t)d0, (uint32_t)s0, (int32_t)dh, (int32_t)sh, (int32_t)dq, (int32_t)sq, (uint32_t)L, (uint32_t)per, (uint32_t)n};
+    return 1;
+}
 int vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
     VkcFrame *f = open_frame();
     if (!f || KC.lost) return 0;
     if (n < 1) return 1;
+    for (int i = 0; i < n; i++)
+        if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) {
+            fprintf(stderr, "[VK] chain: copy region out of range\n"); return 0;
+        }
+    VkcCp2 g;
+    const char *e = getenv("COLI_VK_COPY_GRID");   /* 0: every list through the copy command */
+    if (dst != src && !(e && *e == '0') && cp2_grid(r, n, &g) && cp2_pipe()) {
+        KC.kind = PK_COPY;
+        VkcBind bd[2] = {B(src, 0), B(dst, 1)};
+        uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
+        if (!record(CP2.pipe, bd, 2, &g, sizeof g, gx, gy, 1)) return 0;
+        KC.st.copy_grids++;
+        return 1;
+    }
     VkBufferCopy *c = malloc((size_t)n * sizeof *c);
     if (!c) return 0;
-    for (int i = 0; i < n; i++) {
-        if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) {
-            fprintf(stderr, "[VK] chain: copy region out of range\n"); free(c); return 0;
-        }
-        c[i] = (VkBufferCopy){r[i].src * 4, r[i].dst * 4, r[i].n * 4};
-    }
+    for (int i = 0; i < n; i++) c[i] = (VkBufferCopy){r[i].src * 4, r[i].dst * 4, r[i].n * 4};
     VkBuffer rb = src->buf, wb = dst->buf;
     hazard(f, &rb, 1, &wb, 1);
     vkCmdCopyBuffer(f->cmd, src->buf, dst->buf, (uint32_t)n, c);
@@ -1014,15 +1101,15 @@ static int codes_of(int I) {
  * on first use; NULL for a type it does not decode (Q4_K and Q5_K also want rows of whole
  * 16-byte steps) */
 static VkPipeline bdv_pipe(int t, int nr, int rowWords, int I) {
-    static const int types[] = {8, 12, 13, 14, 16, 20, 21, 22, 23, 42};
+    static const int types[] = {8, 12, 13, 14, 16, 17, 20, 21, 22, 23, 42};
     int on = 0;
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) on |= types[k] == t;
     if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
-    /* the smallest staging only for one row of IQ2_XXS or IQ2_S, whose decoders wait on
+    /* the smallest staging only for one row of IQ2_XXS, IQ2_XS or IQ2_S, whose decoders wait on
      * their grid reads: twice the workgroups an SM hide them, 10240 x 2560 at 61.2 -> 48.4
      * and 66.4 -> 52.0 us. The others read at the memory's rate, and more workgroups cost
      * them: IQ4_XS and IQ4_NL 3-4% for one row, Q8_0 40% for two. */
-    int i4 = nr * (I / 4), b = nr == 1 && (t == 16 || t == 22) ? stage_of(i4 + i4 / 8, KC.bdv_xs) : KC_STAGES;
+    int i4 = nr * (I / 4), b = nr == 1 && (t == 16 || t == 17 || t == 22) ? stage_of(i4 + i4 / 8, KC.bdv_xs) : KC_STAGES;
     if (!KC.bdv_tried[nr - 1][t][b]) {
         KC.bdv_tried[nr - 1][t][b] = 1;
         int32_t v[3] = {stage_vec4(b, KC.bdv_xs), t, nr};
@@ -1062,8 +1149,21 @@ static VkPipeline bdv8_pipe(int t, int nr, int rowWords, int I) {
 int vkc_gemm_bd_ready(void) { return vkc_ready() && KC.mod_bdg != VK_NULL_HANDLE; }
 /* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
 static VkPipeline bdg_pipe(int t, int rowWords) {
-    if (!KC.mod_bdg || t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 ||
+    if (t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 ||
         t == 22 || t == 23 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    /* on the matrix units where the device has them (qmatmul_gemm_bdc.comp; COLI_VK_CHAIN_GEMM=0 off) */
+    if (!KC.bdgc_tried[t]) {
+        KC.bdgc_tried[t] = 1;
+        if (KC.bd && coop_on("COLI_VK_CHAIN_GEMM") && kc_shared_limit() >= GEMM_BDC_SHARED) {
+            if (!KC.mod_bdgc) KC.mod_bdgc = load_module(KC.core.spv_path, "qmatmul_gemm_bdc.spv");
+            int32_t v = t;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &v};
+            KC.bdgc[t] = coop_pipe(KC.mod_bdgc, &si);
+        }
+    }
+    if (KC.bdgc[t]) return KC.bdgc[t];
+    if (!KC.mod_bdg) return VK_NULL_HANDLE;
     if (!KC.bdg_tried[t]) {
         KC.bdg_tried[t] = 1;
         int32_t v = t;
@@ -1086,6 +1186,7 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
         KC.kind = PK_GEMM;
         int ok = record(gp, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + 63) / 64), (uint32_t)((S + 63) / 64), 1);
         KC.st.matmuls += ok; KC.st.gemms += ok;
+        if (gp == KC.bdgc[ti->fmt - 100]) KC.st.tile_gemms += ok;   /* on the matrix units */
         return ok;
     }
     /* a speculative verify's rows (S <= 4) share each weight's decode */
@@ -1130,11 +1231,12 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     x->last_frame = y->last_frame = KC.serial;
     struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
     int ok;
-    /* the vectorized GEMV where the row is whole 16-byte steps and fits the staging */
+    /* the vectorized GEMV where the row is whole 16-byte steps: x staged where the row fits
+     * the staging with its pads, else read from its buffer (xg) */
     int per = ti->fmt == 1 ? 16 : ti->fmt == 4 ? 32 : ti->fmt == 11 || ti->fmt == 14 ? 8 : ti->fmt == 10 ? 4 : 0;
+    int xg = (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 > KC.gemv4_xs;
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
-             (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) &&
-             (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 <= KC.gemv4_xs;   /* the row staged with its pads */
+             (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (xg ? KC.gemv4x : KC.gemv4);
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
     /* a matrix of few long rows: a row a workgroup with every lane on it (an RTX PRO 4000,
@@ -1173,7 +1275,8 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
          * leave the device short of workgroups: a decode's or a verify's rows (a prompt's
          * would stage x once a row of W) */
         if (!(e && *e) && S <= 4 && wg < 128 && nq >= 256) { pc7.lpr = 0; wg = ti->O; }
-        ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+        KC.st.gemv_xg += xg;
+        ok = record(xg ? KC.gemv4x : KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
@@ -1306,7 +1409,7 @@ static VkPipeline fa_pipe(int hd, int gq) {
     VkSpecializationInfo si = {2, me, sizeof sv, sv};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-        .requiredSubgroupSize = 64};
+        .requiredSubgroupSize = (uint32_t)KC.core.coop_sg};
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
                   .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
@@ -1630,23 +1733,53 @@ int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRou
  * the weighted sum of each row's slots */
 /* chain_moe's pipeline (bd: the block formats' paths) staging rows of up to n floats (its
  * stage(): n plus a vec4 of padding every 8; n < 0 the device's largest), made on first use */
-static VkPipeline moe_pipe(int bd, int n) {
+/* fmt: one of our formats (1, 2 or 4) that a pipeline of its own decodes (FMTC), else 0
+ * for the pipeline of every format; the block formats' pipeline (bd) has every format */
+static int moe_fi(int fmt) { return fmt == 1 ? 1 : fmt == 2 ? 2 : fmt == 4 ? 3 : 0; }
+static VkPipeline moe_pipe_f(int bd, int n, int fmt) {
     int cap = (bd ? KC.moe_xs_bd : KC.moe_xs) / 4;
     if (!cap) return VK_NULL_HANDLE;
     int np = (n + 255) & ~255;   /* the 16-byte way pads a row to its words (wide()) */
     int need = n > 0 ? (np + np / 8 + 4 + 3) / 4 : cap, b = stage_of(need, cap);
-    VkPipeline *pp = &KC.moe[bd][b];
-    if (*pp || KC.moe_tried[bd][b]) return *pp;
-    KC.moe_tried[bd][b] = 1;
+    int fi = bd ? 0 : moe_fi(fmt);
+    VkPipeline *pp = fi ? &KC.moe_f[fi - 1][b] : &KC.moe[bd][b];
+    uint8_t *tried = fi ? &KC.moe_f_tried[fi - 1][b] : &KC.moe_tried[bd][b];
+    if (*pp || *tried) return *pp;
+    *tried = 1;
     if (!KC.mod_moe && !(KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) return VK_NULL_HANDLE;
-    int32_t v[2] = {4 * stage_vec4(b, cap), bd};
-    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
-    VkSpecializationInfo si = {2, me, sizeof v, v};
+    int32_t v[3] = {4 * stage_vec4(b, cap), bd, fi ? fmt : 0};
+    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {3, 8, 4}};
+    VkSpecializationInfo si = {3, me, sizeof v, v};
     double t0 = vkc_now_ms();
     *pp = make_pipe(KC.mod_moe, &si);
     double dt = vkc_now_ms() - t0;
     if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv%s took %.1f s to build\n", bd ? " (block formats)" : "", dt / 1e3);
     return *pp;
+}
+static VkPipeline moe_pipe(int bd, int n) { return moe_pipe_f(bd, n, 0); }
+/* lanes a row of n inputs in format fmt: a power of two near n's 16-byte steps / 8, 1 to 32 */
+static int gv_lanes(int fmt, int n) {
+    int steps = n / (fmt == 1 ? 16 : 32), l = 1;
+    while (l < 32 && l * 2 * 8 <= steps) l *= 2;
+    return l;
+}
+/* chain_moe_gv.comp for format fmt (1, 2, 4) and input rows of n floats (a multiple of 32):
+ * NULL where the row does not fit the staging or COLI_VK_MOE_GV=0 */
+static VkPipeline moe_gv_pipe(int fmt, int n) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_MOE_GV"); on = !(e && *e == '0'); }
+    int fi = moe_fi(fmt), cap = KC.moe_xs / 4;
+    if (!on || !fi || !cap || n < 32 || n % 32) return VK_NULL_HANDLE;
+    int need = n / 4 + n / 32 + 1, b = stage_of(need, cap);
+    if (need > stage_vec4(b, cap)) return VK_NULL_HANDLE;
+    VkPipeline *pp = &KC.moe_gv[fi - 1][b];
+    if (*pp || KC.moe_gv_tried[fi - 1][b]) return *pp;
+    KC.moe_gv_tried[fi - 1][b] = 1;
+    if (!KC.mod_moe_gv && !(KC.mod_moe_gv = load_module(KC.core.spv_path, "chain_moe_gv.spv"))) return VK_NULL_HANDLE;
+    int32_t v[2] = {stage_vec4(b, cap), fmt};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof v, v};
+    return *pp = make_pipe(KC.mod_moe_gv, &si);
 }
 /* The routed experts in the CPU's integer form (chain_moe_i8.spv, bdstep_i8.glsl): the
  * types it decodes, and its pipeline for rows of up to n inputs (their codes in the
@@ -1654,7 +1787,7 @@ static VkPipeline moe_pipe(int bd, int n) {
  * default where the device's packed 4 x 8 dot is accelerated. */
 static int moe_i8_type(int fmt) {
     int t = fmt - 100;
-    return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42;
+    return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42;
 }
 static VkPipeline moe_i8_pipe(int n) {
     if (!(KC.idot_set >= 0 ? KC.idot_set && KC.idot : KC.idot == 2) || !KC.moe_xs_bd) return VK_NULL_HANDLE;
@@ -1692,8 +1825,8 @@ static int moe_build(void) {
  * 65 us a layer, against 65, 35 and 6 in a process with room, and its one-row decode went
  * from 13.9 to 27.6 tok/s with them made before the tier. */
 static int rows_make(void);
-static VkPipeline grp_pipe(int v, int t);
-static VkPipeline grpq_pipe(int v);
+static VkPipeline grp_pipe(int v, int t, int coop);
+static VkPipeline grpq_pipe(int v, int coop);
 int vkc_prewarm(const VkcPrewarm *pw) {
     const char *e = getenv("COLI_VK_CHAIN_PREWARM");   /* 1 on any device (tests), 0 never */
     if (!vkc_ready() || !pw || !(e && *e ? *e != '0' : KC.discrete)) return 0;
@@ -1702,6 +1835,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
     VkcBuf *x = vkc_buf(64 * 256 * 4, VKC_DEV), *w = vkc_buf((size_t)64 << 10, VKC_DEV), *y = vkc_buf(64 * 4, VKC_DEV),
            *ids = vkc_buf(16, VKC_DEV), *rw = vkc_buf(16, VKC_DEV), *tab = vkc_buf(COLI_VK_XB_ENTRY * 4, VKC_DEV),
            *hid = vkc_buf(2 * 64 * 4, VKC_DEV);
+    VkcBuf *fo = NULL;   /* the attention's output (attn_hd) */
     int ok = x && w && y && ids && rw && tab && hid && vkc_begin();
     VkBuffer bt = ok && pw->types ? (VkBuffer)coli_vk_block_table_dev(g_kd) : VK_NULL_HANDLE;
     if (ok && KC.bd && bt) {
@@ -1737,6 +1871,16 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         VkcMoe p = {.S = 1, .K = 1, .D = 64, .I = 64, .x_row = 64, .i_row = 1, .w_row = 1, .y_row = 64, .blocks = pw->moe == 2,
                     .stage_n = mn};
         ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
+        /* our formats' pipelines of one format each (1, 2 and 4: what a container's experts are) */
+        for (int f = 1; f <= 4 && ok && pw->moe == 1; f++) {
+            if (!moe_fi(f)) continue;
+            p.gfmt = p.dfmt = f;
+            ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
+            /* and chain_moe_gv.comp's at the layer's widths (its staging sized by them) */
+            if (pw->moe_d > 0 && moe_gv_pipe(f, pw->moe_d)) n++;
+            if (pw->moe_i > 0 && moe_gv_pipe(f, pw->moe_i)) n++;
+        }
+        p.gfmt = p.dfmt = 0;
         /* and the integer form's, for the file's expert types that have it */
         int gi = -1, di = -1;
         for (int t = 0; t < 64; t++) { if ((pw->ex_gu >> t & 1) && moe_i8_type(100 + t) && gi < 0) gi = t; if ((pw->ex_dn >> t & 1) && moe_i8_type(100 + t) && di < 0) di = t; }
@@ -1769,17 +1913,43 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         for (int t = 0; t < 64 && ok; t++)
             for (int v = 0; v < 2 && ok; v++) {
                 if (!((v ? pw->ex_gu : pw->ex_dn) >> t & 1)) continue;
-                VkPipeline g = grp_pipe(v, t);
-                if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
+                for (int c = 0; c < 2 && ok; c++) {   /* in floats and on the matrix units */
+                    VkPipeline g = grp_pipe(v, t, c);
+                    if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
+                }
             }
         /* our formats' grouped GEMMs: the same empty item (no rows, I 0: nothing read) */
         for (int v = 0; v < 2 && ok && pw->ex_ours; v++) {
-            VkPipeline g = grpq_pipe(v);
-            if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
+            for (int c = 0; c < 2 && ok; c++) {
+                VkPipeline g = grpq_pipe(v, c);
+                if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
+            }
         }
     }
+    /* a prompt chunk's attention on the matrix units (chain_attn_flash), launched on one row */
+    if (ok && KC.mod_fa && pw->attn_hd > 0 && pw->attn_hd <= 256 && pw->attn_hd % 64 == 0 && pw->attn_gq > 0 && 16 % pw->attn_gq == 0) {
+        VkPipeline fp = fa_pipe(pw->attn_hd, pw->attn_gq);
+        if (fp) fo = vkc_buf((size_t)16 * 256 * 4, VKC_DEV);
+        if (fo) {
+            int hd = pw->attn_hd, G = pw->attn_gq;
+            VkcAttnW a; memset(&a, 0, sizeof a);
+            a.a = (VkcAttn){.S = 1, .H = G, .KVH = 1, .hd = hd, .cap = 1, .q_row = G * hd, .q_seg = hd, .o_row = G * hd, .scale = 1.f};
+            a.vd = hd;
+            VkcBind ab[7] = {B(x, 0), B(x, 0), B(x, 0), B(fo, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0)};
+            KC.kind = PK_ATTN;
+            ok = record(fp, ab, 7, &a, sizeof a, 1, 1, 1); n += ok;
+        }
+    }
+    /* a prompt chunk's K/V rows into the cache (vkc_copy_regions' grid), launched with no regions */
+    if (ok && cp2_pipe()) {
+        VkcCp2 g = {0};
+        g.len = g.per = 1;
+        VkcBind cb[2] = {B(x, 0), B(y, 1)};
+        KC.kind = PK_COPY;
+        ok = record(CP2.pipe, cb, 2, &g, sizeof g, 1, 1, 1); n += ok;
+    }
     ok = ok && vkc_submit(1);
-    VkcBuf *all[] = {x, w, y, ids, rw, tab, hid};
+    VkcBuf *all[] = {x, w, y, ids, rw, tab, hid, fo};
     for (size_t k = 0; k < sizeof all / sizeof *all; k++) if (all[k]) vkc_free(all[k]);
     if (!ok) return 0;
     if (n) fprintf(stderr, "[VK] chain: %d pipelines made before the expert tier, in %.1f s (COLI_VK_CHAIN_PREWARM=0: at first use)\n",
@@ -1795,6 +1965,15 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
                     ? moe_i8_pipe(sn) : VK_NULL_HANDLE;
     if (mp) KC.st.moe_i8++;
     else mp = moe_pipe(p->blocks != 0, sn);
+    /* our formats: each pass on the pipeline of its matrices' format (chain_moe.comp's FMTC),
+     * where the layer's is known and one of 1, 2, 4 */
+    VkPipeline mg = mp, md = mp;
+    if (!p->blocks) {
+        VkPipeline g = moe_fi(p->gfmt) ? moe_pipe_f(0, sn, p->gfmt) : VK_NULL_HANDLE;
+        VkPipeline d = moe_fi(p->dfmt) ? moe_pipe_f(0, sn, p->dfmt) : VK_NULL_HANDLE;
+        if (g) mg = g;
+        if (d) md = d;
+    }
     if (!mp || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
         (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
         hid == x || hid == y || y == x) return 0;
@@ -1826,38 +2005,80 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     VkcBind bt = tabbuf ? (VkcBind){tabbuf, 0, 0, 0} : B(NULL, 0);
     VkcBind bd[7] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(NULL, 0), bt};
     uint32_t gx, gy;
+    /* our formats with whole 16-byte rows: chain_moe_gv.comp's passes (a dense GEMV's layout) */
+    VkPipeline gvg = !p->blocks ? moe_gv_pipe(p->gfmt, p->D) : VK_NULL_HANDLE;
+    VkPipeline gvd = gvg && p->I % 32 == 0 ? moe_gv_pipe(p->dfmt, p->I) : VK_NULL_HANDLE;
+    if (gvg && gvd) {
+        /* lanes a row: about eight 16-byte steps each (Qwen3.6's 2048 inputs 8, its 512 2:
+         * an RTX PRO 4000's layer 47-50 us, against 51 at 4 and 4, 53 at 32) */
+        int l0 = gv_lanes(p->gfmt, p->D), l1 = gv_lanes(p->dfmt, p->I);
+        struct { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles; } gp =
+            {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b, p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, l0, 1};
+        int upw = 256 / l0, nwg = (p->K * p->I + upw - 1) / upw;   /* units a workgroup, at subgroups of 64 */
+        if (nwg > 1024) nwg = 1024;
+        if (!record(gvg, bd, 7, &gp, sizeof gp, (uint32_t)nwg, (uint32_t)p->S, 1)) return 0;
+        int rpp = 256 / l1;   /* a down tile: the rows one pass of the workgroup takes */
+        gp.mode = 1; gp.lpr = l1; gp.tiles = (p->D + rpp - 1) / rpp;
+        grid((uint64_t)p->S * p->K * gp.tiles, &gx, &gy);
+        if (!record(gvd, bd, 7, &gp, sizeof gp, gx, gy, 1)) return 0;
+        KC.st.moe_gv++;
+    } else {
     pc.rpw = rg; pc.spl = sg;
     grid((uint64_t)p->S * p->K * ((p->I + rg - 1) / rg), &gx, &gy);
-    if (!record(mp, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
+    if (!record(mg, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
     pc.mode = 1; pc.rpw = rd; pc.spl = sd;
     grid((uint64_t)p->S * p->K * ((p->D + rd - 1) / rd), &gx, &gy);
-    if (!record(mp, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
+    if (!record(md, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
+    }
     pc.mode = 2;
     VkcBind bd2[7] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1), bt};
     grid((uint64_t)p->S * ((p->D + 255) / 256), &gx, &gy);
-    return record(mp, bd2, 7, &pc, sizeof pc, gx, gy, 1);
+    return record(mg, bd2, 7, &pc, sizeof pc, gx, gy, 1);
 }
 /* ---- a prompt chunk's routed experts (chain_moe_rows.comp, qmatmul_grp*_bd.comp) ------ */
 /* the ggml types bdstep.glsl decodes */
-static int bd_type(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
-/* the grouped GEMM's pipeline for pass v (1 gate+up, 0 down) and ggml type t */
-static VkPipeline grp_pipe(int v, int t) {
+static int bd_type(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
+/* the grouped GEMM's pipeline for pass v (1 gate+up, 0 down) and ggml type t: on the matrix
+ * units (coop, qmatmul_grp*_bdc.comp, where the device has cooperative matrices at subgroups
+ * of 64 or 32, unless COLI_VK_GRP_COOP=0) or in floats (qmatmul_grp*_bd.comp) */
+static VkPipeline grp_pipe(int v, int t, int coop) {
     static const char *file[2] = {"qmatmul_grp_bd.spv", "qmatmul_grp_gate_up_bd.spv"};
+    static const char *cfile[2] = {"qmatmul_grp_bdc.spv", "qmatmul_grp_gate_up_bdc.spv"};
     if (t < 0 || t >= 64 || !bd_type(t)) return VK_NULL_HANDLE;
+    int32_t c = t;
+    VkSpecializationMapEntry me = {0, 0, 4};
+    VkSpecializationInfo si = {1, &me, 4, &c};
+    if (coop) {
+        if (!KC.grpc_tried[v][t]) {
+            KC.grpc_tried[v][t] = 1;
+            if (coop_on("COLI_VK_GRP_COOP")) {
+                if (!KC.mod_grpc[v]) KC.mod_grpc[v] = load_module(KC.core.spv_path, cfile[v]);
+                KC.grpc[v][t] = coop_pipe(KC.mod_grpc[v], &si);
+            }
+        }
+        return KC.grpc[v][t];
+    }
     if (!KC.grp_tried[v][t]) {
         KC.grp_tried[v][t] = 1;
         if (!KC.mod_grp[v]) KC.mod_grp[v] = load_module(KC.core.spv_path, file[v]);
-        int32_t c = t;
-        VkSpecializationMapEntry me = {0, 0, 4};
-        VkSpecializationInfo si = {1, &me, 4, &c};
         if (KC.mod_grp[v]) KC.grp[v][t] = make_pipe(KC.mod_grp[v], &si);
     }
     return KC.grp[v][t];
 }
-/* the grouped GEMM of our own formats (qmatmul_grp_q.comp, [0] down, [1] gate+up): one
- * pipeline for 1, 2 and 4, the format the expert table's */
-static VkPipeline grpq_pipe(int v) {
+/* the grouped GEMM of our own formats ([0] down, [1] gate+up): one pipeline for 1, 2 and 4,
+ * the format the expert table's; on the matrix units (coop, qmatmul_grp_qc.comp, as
+ * grp_pipe's) or in floats (qmatmul_grp_q.comp) */
+static VkPipeline grpq_pipe(int v, int coop) {
     static const char *file[2] = {"qmatmul_grp_q.spv", "qmatmul_grp_gate_up_q.spv"};
+    static const char *cfile[2] = {"qmatmul_grp_qc.spv", "qmatmul_grp_gate_up_qc.spv"};
+    if (coop) {
+        if (!KC.grpqc_tried[v]) {
+            KC.grpqc_tried[v] = 1;
+            if (coop_on("COLI_VK_GRP_COOP") && (KC.mod_grpqc[v] = load_module(KC.core.spv_path, cfile[v])))
+                KC.grpqc[v] = coop_pipe(KC.mod_grpqc[v], NULL);
+        }
+        return KC.grpqc[v];
+    }
     if (!KC.grpq_tried[v]) {
         KC.grpq_tried[v] = 1;
         if ((KC.mod_grpq[v] = load_module(KC.core.spv_path, file[v]))) KC.grpq[v] = make_pipe(KC.mod_grpq[v], NULL);
@@ -1866,7 +2087,19 @@ static VkPipeline grpq_pipe(int v) {
 }
 static int our_fmt(int f) { return f == 1 || f == 2 || f == 4; }
 /* pass v's (1 gate+up, 0 down) pipeline for a matrix of format f: a GGUF's block type, or ours */
-static VkPipeline rows_pipe(int v, int f) { return f >= 100 ? grp_pipe(v, f - 100) : our_fmt(f) ? grpq_pipe(v) : VK_NULL_HANDLE; }
+static VkPipeline rows_pipe1(int v, int f, int coop) {
+    return f >= 100 ? grp_pipe(v, f - 100, coop) : our_fmt(f) ? grpq_pipe(v, coop) : VK_NULL_HANDLE;
+}
+/* coop asks for the matrix units, which a format or a device without them answers in floats;
+ * without the floats' pipeline (too little shared memory for it), the matrix units' */
+static VkPipeline rows_pipe(int v, int f, int coop) {
+    VkPipeline p = coop ? rows_pipe1(v, f, 1) : VK_NULL_HANDLE;
+    if (!p) p = rows_pipe1(v, f, 0);
+    return p ? p : rows_pipe1(v, f, 1);
+}
+static int rows_coop(int v, int f, VkPipeline p) {
+    return p && (f >= 100 && f < 164 ? p == KC.grpc[v][f - 100] : our_fmt(f) && p == KC.grpqc[v]);
+}
 /* One dispatch whose group counts the device wrote (args at byte off of a buffer an earlier
  * dispatch of the frame wrote): the bindings' hazards as record's, and a barrier the
  * indirect read waits on. */
@@ -1922,7 +2155,7 @@ static int rows_make(void) {
 int vkc_moe_rows_ready(int gfmt, int dfmt) {
     /* a GGUF's block types (their decoders read the block table), or our formats (both matrices) */
     int bd = gfmt >= 100 && dfmt >= 100 && coli_vk_block_table_addr(g_kd), q = our_fmt(gfmt) && our_fmt(dfmt);
-    return (bd || q) && rows_make() && rows_pipe(1, gfmt) && rows_pipe(0, dfmt);
+    return (bd || q) && rows_make() && rows_pipe(1, gfmt, 0) && rows_pipe(0, dfmt, 0);
 }
 void vkc_moe_rows_free(VkcMoeRows *r) {
     VkcBuf **b[7] = {&r->cnt, &r->amap, &r->items, &r->etab, &r->aux, &r->hid, &r->yk};
@@ -1957,11 +2190,15 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
     r->etab->last_frame = KC.serial;
-    ok = ok && record_indirect(rows_pipe(1, p->gfmt), gb, 5, &pg, sizeof pg, r->aux, 0);
+    /* on the matrix units unless the caller keeps the floats (p->floats: the tier's host pool,
+     * whose experts the GEMMs read over PCIe; there the floats' were faster) */
+    VkPipeline pgu = rows_pipe(1, p->gfmt, !p->floats), pdn = rows_pipe(0, p->dfmt, !p->floats);
+    ok = ok && record_indirect(pgu, gb, 5, &pg, sizeof pg, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
-    ok = ok && record_indirect(rows_pipe(0, p->dfmt), db, 5, &pd, sizeof pd, r->aux, 16);
+    ok = ok && record_indirect(pdn, db, 5, &pd, sizeof pd, r->aux, 16);
+    if (ok) KC.st.grp_coop += rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);
     /* the rows' sums over their experts, in rank order */
     pc.mode = 3;
     VkcBind yb[7] = {B(ids, 0), B(table, 0), B(NULL, 0), B(NULL, 0), B(w, 0), B(r->yk, 0), B(y, 1)};
@@ -2560,6 +2797,7 @@ void vkc_shutdown(void) {
     if (KC.cpool) vkDestroyCommandPool(KC.dev, KC.cpool, NULL);
     kx_shutdown();
     kab_shutdown();
+    cp2_shutdown();
     ke_shutdown();
     kf_shutdown();
     kva_shutdown();
@@ -2577,6 +2815,7 @@ void vkc_shutdown(void) {
     if (KC.mod_tg) vkDestroyShaderModule(KC.dev, KC.mod_tg, NULL);
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
+    if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
@@ -2585,9 +2824,16 @@ void vkc_shutdown(void) {
         if (KC.bdv[r][t][b]) vkDestroyPipeline(KC.dev, KC.bdv[r][t][b], NULL);
     for (int t = 0; t < 64; t++) if (KC.bdg[t]) vkDestroyPipeline(KC.dev, KC.bdg[t], NULL);
     if (KC.mod_bdg) vkDestroyShaderModule(KC.dev, KC.mod_bdg, NULL);
+    for (int t = 0; t < 64; t++) if (KC.bdgc[t]) vkDestroyPipeline(KC.dev, KC.bdgc[t], NULL);
+    if (KC.mod_bdgc) vkDestroyShaderModule(KC.dev, KC.mod_bdgc, NULL);
+    for (int v = 0; v < 2; v++) {
+        for (int t = 0; t < 64; t++) if (KC.grpc[v][t]) vkDestroyPipeline(KC.dev, KC.grpc[v][t], NULL);
+        if (KC.mod_grpc[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpc[v], NULL);
+    }
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     for (int d = 0; d < 2; d++) for (int b = 0; b <= KC_STAGES; b++) if (KC.moe[d][b]) vkDestroyPipeline(KC.dev, KC.moe[d][b], NULL);
+    for (int f = 0; f < 3; f++) for (int b = 0; b <= KC_STAGES; b++) if (KC.moe_f[f][b]) vkDestroyPipeline(KC.dev, KC.moe_f[f][b], NULL);
     for (int b = 0; b <= KC_STAGES; b++) if (KC.moe_i8[b]) vkDestroyPipeline(KC.dev, KC.moe_i8[b], NULL);
     for (int r = 0; r < 4; r++) for (int t = 0; t < 64; t++) for (int b = 0; b <= KC_STAGES; b++)
         if (KC.bdv8[r][t][b]) vkDestroyPipeline(KC.dev, KC.bdv8[r][t][b], NULL);
@@ -2600,8 +2846,12 @@ void vkc_shutdown(void) {
         if (KC.mod_grp[v]) vkDestroyShaderModule(KC.dev, KC.mod_grp[v], NULL);
         if (KC.grpq[v]) vkDestroyPipeline(KC.dev, KC.grpq[v], NULL);
         if (KC.mod_grpq[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpq[v], NULL);
+        if (KC.grpqc[v]) vkDestroyPipeline(KC.dev, KC.grpqc[v], NULL);
+        if (KC.mod_grpqc[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpqc[v], NULL);
     }
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
+    for (int f = 0; f < 3; f++) for (int b = 0; b < 10; b++) if (KC.moe_gv[f][b]) vkDestroyPipeline(KC.dev, KC.moe_gv[f][b], NULL);
+    if (KC.mod_moe_gv) vkDestroyShaderModule(KC.dev, KC.mod_moe_gv, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);
     for (int i = 0; i < KC.nfa; i++) vkDestroyPipeline(KC.dev, KC.fa[i], NULL);

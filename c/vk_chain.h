@@ -94,7 +94,8 @@ int  vkc_layer_recorded(int *layers);
 /* transfers, recorded into the open frame (offsets and counts in floats) */
 int  vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n);
 int  vkc_zero(VkcBuf *dst, size_t off, size_t n);
-/* one copy command over n regions (a KV row per head, say) */
+/* n regions (a KV row per head, say): one dispatch when they lie on a grid (chain_copy2d.comp;
+ * COLI_VK_COPY_GRID=0 never), else one copy command */
 typedef struct { size_t dst, src, n; } VkcRegion;
 int  vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
 int  vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes);   /* through the frame's staging */
@@ -422,6 +423,7 @@ typedef struct {
     int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
     int dfmt, E;  /* vkc_moe_rows: down's format, and the layer's experts (its table's entries from t_off) */
     int stage_n;  /* the widest input row its staging is sized for: 0 = D's or I's, < 0 = the device's largest */
+    int floats;   /* vkc_moe_rows: 1 keeps the grouped GEMMs in floats where the matrix units' would run */
 } VkcMoe;
 int vkc_moe_ready(void);
 /* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
@@ -441,7 +443,7 @@ void vkc_moe_rows_free(VkcMoeRows *r);
  * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
  * DeltaNet's recurrence for key dimension dn_kd (0: none), and a prompt chunk's grouped
  * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, or for our
- * own formats (ex_ours). An engine
+ * own formats (ex_ours), and the attention on the matrix units (attn_hd, attn_gq). An engine
  * calls it once its dense chain is placed, before its expert tier fills the device. A
  * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
  * made. */
@@ -450,6 +452,7 @@ typedef struct {
     int ex_ours;                /* the experts are our own formats (1, 2, 4): their grouped GEMMs (qmatmul_grp_q.comp) */
     int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
     int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
+    int attn_hd, attn_gq;       /* the attention's head dim and query heads per kv head: chain_attn_flash's (0: none) */
 } VkcPrewarm;
 /* a width of x the model's GEMVs meet, once (vkc_prewarm makes the staging size it takes) */
 static inline void vkc_prewarm_width(VkcPrewarm *pw, int I) {
@@ -820,9 +823,13 @@ typedef struct {
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
     unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
-    unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
+    unsigned long long tile_gemms;     /* prompt matmuls on the matrix units (chain_gemm.comp, qmatmul_gemm_bdc.comp) */
     unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
     unsigned long long gemv_i8;        /* a GGUF's dense GEMVs in it (chain_gemv_bd_i8) */
+    unsigned long long copy_grids;     /* region lists copied by one dispatch (chain_copy2d, vkc_copy_regions) */
+    unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
+    unsigned long long gemv_xg;        /* decode GEMVs whose row is past the staging: x from its buffer (chain_gemv.comp XG) */
+    unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */
