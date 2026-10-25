@@ -554,6 +554,12 @@ class CovStats:
                              shape=(self.layers, self.hidden, self.hidden))
         self.damp, self._layer, self._u = damp, None, None
 
+    def close(self):
+        """Release the mapping: Windows cannot delete a file that is still mapped."""
+        mat, self.mat = self.mat, None
+        if mat is not None and getattr(mat, "_mmap", None) is not None:
+            mat._mmap.close()
+
     def _factor(self, layer):
         if self._layer != layer:
             m = np.array(self.mat[layer])
@@ -968,6 +974,13 @@ class Source:
         return {"config_sha256": hashlib.sha256(self.config_bytes).hexdigest(),
                 "shards": {os.path.basename(p): os.path.getsize(p) for p in shards}}
 
+    def close(self):
+        """Close the shard descriptors: Windows cannot delete or replace a file
+        while one is still open."""
+        fds, self._fds = self._fds, {}
+        for fd in fds.values():
+            os.close(fd)
+
     def _read(self, path, offset, nbytes):
         fd = self._fds.get(path)
         if fd is None:
@@ -1040,6 +1053,15 @@ _COV = None
 _DUMP = None
 _FMT = None
 _ALPHA = 0.1
+
+
+def _close_sources(src):
+    """Close src and the in-process worker's Source (workers=1 runs _init_worker here)."""
+    global _SOURCE
+    src.close()
+    if _SOURCE is not None:
+        _SOURCE.close()
+        _SOURCE = None
 
 
 def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None, fmt_name=None, alpha=0.1,
@@ -1332,6 +1354,7 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
         if pool:
             pool.close()
             pool.join()
+        _close_sources(src)
     print(f"{out_dir}: output rescale on {len(done)}/{g.layers} layers")
 
 
@@ -1456,6 +1479,7 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         if pool:
             pool.close()
             pool.join()
+        _close_sources(src)
     state = "complete" if index["complete"] else f"{len(index['done'])}/{g.layers} layers"
     print(f"{out_dir}: {state}" + (f", worst expert matrix rel L2 {worst:.4f}" if todo else ""))
     return out_dir

@@ -97,6 +97,11 @@ def _cc_flags():
                 "this harness without OpenMP" % (prefix, inc))
         cflags += ["-Xclang", "-fopenmp", "-I", inc]
         ldflags += ["-L", lib, "-lomp"]
+    if sys.platform == "win32":
+        # compat.h refuses a Windows off_t that is not 64-bit; the Makefile
+        # passes -D_FILE_OFFSET_BITS=64 and -fopenmp there too.
+        cflags += ["-D_FILE_OFFSET_BITS=64", "-fopenmp"]
+        ldflags += ["-fopenmp"]
     return cc, cflags, ldflags
 
 

@@ -11,6 +11,7 @@ numpy only:
   * CovStats: the factor it hands out is upper triangular and inverts the damped H;
   * the error-carrying quantizer (GPTQ) lowers the output error under a correlated H.
 """
+import contextlib
 import math
 import os
 import struct
@@ -105,15 +106,15 @@ class Int2Convert(unittest.TestCase):
         a = self.rng.standard_normal((256, 64))
         m = a @ a.T + np.eye(256)
         with tempfile.TemporaryDirectory() as tmp:
-            cov = cv.CovStats(self._cov_file(tmp, [m, 2 * m]))
-            imp = self.rng.uniform(0.5, 2.0, 256)
-            u = cov.upper_inv(0, imp)
-            self.assertTrue(np.allclose(np.tril(u, -1), 0))
-            dg = np.sqrt(np.diag(m))
-            c = m / dg[:, None] / dg[None, :] + cov.damp * np.eye(256)
-            h = np.sqrt(imp)[:, None] * c * np.sqrt(imp)[None, :]
-            np.testing.assert_allclose(u.T @ u @ h, np.eye(256), atol=1e-6)
-            np.testing.assert_allclose(cov.upper_inv(1, imp), u)   # the scale of a layer's matrix does not matter
+            with contextlib.closing(cv.CovStats(self._cov_file(tmp, [m, 2 * m]))) as cov:
+                imp = self.rng.uniform(0.5, 2.0, 256)
+                u = cov.upper_inv(0, imp)
+                self.assertTrue(np.allclose(np.tril(u, -1), 0))
+                dg = np.sqrt(np.diag(m))
+                c = m / dg[:, None] / dg[None, :] + cov.damp * np.eye(256)
+                h = np.sqrt(imp)[:, None] * c * np.sqrt(imp)[None, :]
+                np.testing.assert_allclose(u.T @ u @ h, np.eye(256), atol=1e-6)
+                np.testing.assert_allclose(cov.upper_inv(1, imp), u)   # the scale of a layer's matrix does not matter
 
     def test_gptq_lowers_output_error(self):
         a = self.rng.standard_normal((256, 16))
@@ -121,10 +122,11 @@ class Int2Convert(unittest.TestCase):
         w = (self.rng.standard_normal((32, 256)) * 0.02).astype(np.float32)
         imp = np.diag(m).astype(np.float32)
         with tempfile.TemporaryDirectory() as tmp:
-            cov = cv.CovStats(self._cov_file(tmp, [m]))
-            u = cov.upper_inv(0, imp)
+            with contextlib.closing(cv.CovStats(self._cov_file(tmp, [m]))) as cov:
+                u = cov.upper_inv(0, imp)
+                damp = cov.damp
             dg = np.sqrt(np.diag(m))
-            h = (m / dg[:, None] / dg[None, :] + cov.damp * np.eye(256)) * np.sqrt(imp)[:, None] * np.sqrt(imp)[None, :]
+            h = (m / dg[:, None] / dg[None, :] + damp * np.eye(256)) * np.sqrt(imp)[:, None] * np.sqrt(imp)[None, :]
             plain = cv.dequantize_int2(*cv.quantize_int2_g32(w, imp))
             gptq = cv.dequantize_int2(*cv.quantize_int2_g32_gptq(w, imp, u))
             self.assertLess(out_err(w.astype(np.float64), gptq, h), 0.8 * out_err(w.astype(np.float64), plain, h))
